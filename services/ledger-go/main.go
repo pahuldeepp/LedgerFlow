@@ -1,6 +1,5 @@
 package main
 
-
 import (
 	"context"
 	"encoding/json"
@@ -10,9 +9,23 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+var db *pgxpool.Pool
+
+// ==========================
+// STRUCTS
+// ==========================
+
+type Entry struct {
+	AccountID string `json:"account_id"`
+	Direction string `json:"direction"`
+	Amount    int64  `json:"amount"`
+}
+
 type TransactionPostedEvent struct {
 	EventID       string  `json:"event_id"`
 	TransactionID string  `json:"transaction_id"`
@@ -22,43 +35,43 @@ type TransactionPostedEvent struct {
 	Version       int     `json:"version"`
 }
 
-var db *pgxpool.Pool
-
-type Entry struct {
-	AccountID string `json:"account_id" binding:"required"`
-	Direction string `json:"direction" binding:"required"` // debit | credit
-	Amount    int64  `json:"amount" binding:"required"`
-}
-
 type CreateTransactionRequest struct {
 	IdempotencyKey string  `json:"idempotency_key" binding:"required"`
 	Entries        []Entry `json:"entries" binding:"required"`
 }
 
+// ==========================
+// MAIN
+// ==========================
+
 func main() {
-    dsn := "postgres://postgres:postgres@127.0.0.1:5432/ledgerflow?sslmode=disable"
 
-    var err error
-    db, err = pgxpool.New(context.Background(), dsn)
-    if err != nil {
-        log.Fatalf("Unable to connect to database: %v", err)
-    }
-    defer db.Close()
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		log.Fatal("DATABASE_URL not set")
+	}
 
-    log.Println("Connected to database successfully")
+	var err error
+	db, err = pgxpool.New(context.Background(), dsn)
+	if err != nil {
+		log.Fatalf("Unable to connect to database: %v", err)
+	}
+	defer db.Close()
 
-    // 🔥 Start Kafka + Outbox worker
-    initKafkaProducer()
-    startOutboxWorker()
-    defer closeKafkaProducer()
+	log.Println("Connected to database successfully")
 
-    r := gin.New()
-    r.Use(gin.Logger(), gin.Recovery())
+	initKafkaProducer()
+	startOutboxWorker()
+	defer closeKafkaProducer()
 
+	r := gin.New()
+	r.Use(gin.Logger(), gin.Recovery())
+
+	// ==========================
+	// HEALTH
+	// ==========================
 	r.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{
-			"status": "ok",
-		})
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
 
 	// ==========================
@@ -121,7 +134,6 @@ func main() {
 			return
 		}
 
-		// If already processed, return same transaction ID
 		if !isNew {
 			c.JSON(http.StatusOK, gin.H{
 				"status":         "already_processed",
@@ -130,7 +142,7 @@ func main() {
 			return
 		}
 
-		// Insert entries only if new
+		// Insert entries
 		for _, e := range req.Entries {
 			_, err := tx.Exec(ctx, `
 				INSERT INTO entries (transaction_id, account_id, direction, amount)
@@ -143,31 +155,35 @@ func main() {
 			}
 		}
 
+		// ✅ Proper event identity separation
+		eventID := uuid.New().String()
+
 		event := TransactionPostedEvent{
-	EventID:       txID, // (better: separate UUID for event_id later)
-	TransactionID: txID,
-	Entries:       req.Entries,
-	Status:        "posted",
-	OccurredAt:    time.Now().UTC().Format(time.RFC3339Nano),
-	Version:       1,
-}
+			EventID:       eventID,
+			TransactionID: txID,
+			Entries:       req.Entries,
+			Status:        "posted",
+			OccurredAt:    time.Now().UTC().Format(time.RFC3339Nano),
+			Version:       1,
+		}
 
-payloadBytes, err := json.Marshal(event)
-if err != nil {
-	c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to marshal event"})
-	return
-}
+		payloadBytes, err := json.Marshal(event)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to marshal event"})
+			return
+		}
 
-	_, err = tx.Exec(ctx, `
-	INSERT INTO outbox (aggregate_type, aggregate_id, event_type, payload)
-	VALUES ($1, $2, $3, $4)
-`, "transaction", txID, "ledger.transaction.posted", payloadBytes)
-
+		// Insert into outbox
+		_, err = tx.Exec(ctx, `
+			INSERT INTO outbox (aggregate_type, aggregate_id, event_type, payload)
+			VALUES ($1, $2, $3, $4)
+		`, "transaction", txID, "ledger.transaction.posted", payloadBytes)
 
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to insert into outbox"})
 			return
 		}
+
 		if err := tx.Commit(ctx); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "commit failed"})
 			return
@@ -181,14 +197,14 @@ if err != nil {
 	})
 
 	// ==========================
-	// METRICS ENDPOINT
+	// METRICS
 	// ==========================
 	r.GET("/metrics", func(c *gin.Context) {
 		promhttp.Handler().ServeHTTP(c.Writer, c.Request)
 	})
 
 	// ==========================
-	// BALANCE ENDPOINT
+	// BALANCE (READ MODEL — TRUE CQRS)
 	// ==========================
 	r.GET("/accounts/:id/balance", func(c *gin.Context) {
 		accountID := c.Param("id")
@@ -196,18 +212,17 @@ if err != nil {
 		var balance int64
 
 		err := db.QueryRow(context.Background(), `
-			SELECT COALESCE(SUM(
-				CASE
-					WHEN direction = 'credit' THEN amount
-					WHEN direction = 'debit'  THEN -amount
-				END
-			), 0)
-			FROM entries
+			SELECT balance
+			FROM read_model.account_balances
 			WHERE account_id = $1
 		`, accountID).Scan(&balance)
 
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			// If account not yet projected, return 0
+			c.JSON(http.StatusOK, gin.H{
+				"account_id": accountID,
+				"balance":    0,
+			})
 			return
 		}
 
@@ -221,8 +236,6 @@ if err != nil {
 	if port == "" {
 		port = "8081"
 	}
-
-
 
 	log.Printf("Server running on port %s", port)
 	log.Fatal(r.Run(":" + port))

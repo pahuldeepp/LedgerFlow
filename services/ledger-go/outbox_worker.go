@@ -16,7 +16,7 @@ const (
 type outboxItem struct {
 	id        string
 	eventType string
-	payload   []byte
+	payload   string
 }
 
 func startOutboxWorker() {
@@ -56,7 +56,7 @@ func processOutboxBatch() error {
 	defer tx.Rollback(ctx)
 
 	rows, err := tx.Query(ctx, `
-		SELECT id::text, event_type, payload::bytea
+		SELECT id::text, event_type, payload::text
 		FROM outbox
 		WHERE published_at IS NULL
 		  AND attempts < $1
@@ -86,7 +86,7 @@ func processOutboxBatch() error {
 
 	// 2) Publish outside DB tx (network I/O must not hold locks)
 	for _, it := range batch {
-		if err := publishToKafka(it.id, it.payload); err != nil {
+		if err := publishToKafka(it.id, []byte(it.payload)); err != nil {
 			if outboxPublishFailedTotal != nil {
 				outboxPublishFailedTotal.Inc()
 			}
