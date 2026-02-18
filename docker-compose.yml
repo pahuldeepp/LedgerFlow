@@ -4,6 +4,7 @@ services:
   postgres:
     container_name: ledgerflow-postgres
     image: postgres:15
+    command: postgres -c password_encryption=scram-sha-256
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -12,6 +13,7 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
 
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.1
@@ -20,6 +22,7 @@ services:
       ZOOKEEPER_TICK_TIME: 2000
     ports:
       - "2181:2181"
+    restart: unless-stopped
 
   kafka:
     image: confluentinc/cp-kafka:7.6.1
@@ -35,6 +38,25 @@ services:
       KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
       KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    restart: unless-stopped
+
+  pgbouncer:
+    container_name: ledgerflow-pgbouncer
+    image: edoburu/pgbouncer
+    depends_on:
+      - postgres
+    environment:
+      DB_HOST: postgres
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: ledgerflow
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: 200
+      DEFAULT_POOL_SIZE: 20
+      AUTH_TYPE: scram-sha-256
+    ports:
+      - "6432:5432"
+    restart: unless-stopped
 
   ledger:
     container_name: ledgerflow-ledger
@@ -43,11 +65,11 @@ services:
     ports:
       - "8080:8081"
     environment:
-      DATABASE_URL: postgres://postgres:postgres@postgres:5432/ledgerflow?sslmode=disable
+      DATABASE_URL: postgres://postgres:postgres@pgbouncer:5432/ledgerflow?sslmode=disable
       KAFKA_BROKERS: kafka:29092
       KAFKA_TOPIC: ledger.transactions
     depends_on:
-      - postgres
+      - pgbouncer
       - kafka
     restart: unless-stopped
 
@@ -55,14 +77,18 @@ services:
     container_name: ledgerflow-read-model
     build:
       context: ./services/read-model-builder
-    environment:
-      DATABASE_URL: postgres://postgres:postgres@postgres:5432/ledgerflow?sslmode=disable
-      KAFKA_BROKERS: kafka:29092
-      KAFKA_TOPIC: ledger.transactions
     depends_on:
-      - postgres
+      - pgbouncer
       - kafka
     restart: unless-stopped
+    ports:
+      - "9101:9101"
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@pgbouncer:5432/ledgerflow?sslmode=disable
+      KAFKA_BROKERS: kafka:29092
+      KAFKA_TOPIC: ledger.transactions
+      METRICS_ADDR: :9101
+
 
 volumes:
   postgres_data:

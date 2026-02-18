@@ -2,40 +2,61 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-func handleTransactionPosted(ctx context.Context, db *pgxpool.Pool, event TransactionPostedEvent) error {
+// returns: processed=true if first time, processed=false if duplicate
+func handleTransactionPosted(ctx context.Context, db *pgxpool.Pool, event TransactionPostedEvent) (bool, error) {
 	tx, err := db.Begin(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer tx.Rollback(ctx)
 
-	// Parse occurred_at string → time.Time
 	occurredAt, err := time.Parse(time.RFC3339Nano, event.OccurredAt)
 	if err != nil {
-		return err
+		return false, err
 	}
 
-	// 1️⃣ DEDUPE (exactly-once-ish)
+	// 1) Idempotent processing guard
 	tag, err := tx.Exec(ctx, `
 		INSERT INTO read_model.processed_events (event_id, consumer_name)
-		VALUES ($1, 'read-model-builder')
+		VALUES ($1::uuid, 'read-model-builder')
 		ON CONFLICT (event_id, consumer_name) DO NOTHING
 	`, event.EventID)
 	if err != nil {
-		return err
+		return false, err
 	}
 
+	// already processed
 	if tag.RowsAffected() == 0 {
-		return tx.Commit(ctx) // already processed
+		if err := tx.Commit(ctx); err != nil {
+			return false, err
+		}
+		return false, nil
 	}
 
-	// 2️⃣ UPDATE BALANCES
+	// 2) Store payload in tx_feed
+	payloadBytes, err := json.Marshal(event)
+	if err != nil {
+		return false, err
+	}
+
+	_, err = tx.Exec(ctx, `
+		INSERT INTO read_model.tx_feed
+			(event_id, transaction_id, occurred_at, payload)
+		VALUES ($1::uuid, $2::uuid, $3, $4::jsonb)
+		ON CONFLICT (event_id) DO NOTHING
+	`, event.EventID, event.TransactionID, occurredAt, payloadBytes)
+	if err != nil {
+		return false, err
+	}
+
+	// 3) Update balances + account index
 	for _, entry := range event.Entries {
 		var delta int64
 
@@ -45,56 +66,37 @@ func handleTransactionPosted(ctx context.Context, db *pgxpool.Pool, event Transa
 		case "credit":
 			delta = entry.Amount
 		default:
-			return errors.New("invalid entry.direction: " + entry.Direction)
+			return false, errors.New("invalid direction")
 		}
 
+		// balance
 		_, err := tx.Exec(ctx, `
-			INSERT INTO read_model.account_balances
-				(account_id, balance, updated_at)
+			INSERT INTO read_model.account_balances (account_id, balance, updated_at)
 			VALUES ($1, $2, now())
 			ON CONFLICT (account_id)
 			DO UPDATE SET
 				balance = read_model.account_balances.balance + EXCLUDED.balance,
 				updated_at = now()
 		`, entry.AccountID, delta)
-
 		if err != nil {
-			return err
+			return false, err
 		}
-	}
 
-	// 3️⃣ TX FEED
-	_, err = tx.Exec(ctx, `
-		INSERT INTO read_model.tx_feed
-			(tx_id, created_at, amount, status)
-		VALUES ($1, $2, $3, 'posted')
-		ON CONFLICT (tx_id) DO NOTHING
-	`,
-		event.TransactionID,
-		occurredAt,
-		event.TotalAmount(),
-	)
-	if err != nil {
-		return err
-	}
-
-	// 4️⃣ ACCOUNT -> TX INDEX
-	for _, entry := range event.Entries {
-		_, err := tx.Exec(ctx, `
+		// index
+		_, err = tx.Exec(ctx, `
 			INSERT INTO read_model.account_tx_index
-				(account_id, created_at, tx_id)
-			VALUES ($1, $2, $3)
+				(account_id, occurred_at, event_id, transaction_id, direction, amount)
+			VALUES ($1, $2, $3::uuid, $4::uuid, $5, $6)
 			ON CONFLICT DO NOTHING
-		`,
-			entry.AccountID,
-			occurredAt,
-			event.TransactionID,
-		)
-
+		`, entry.AccountID, occurredAt, event.EventID, event.TransactionID, entry.Direction, entry.Amount)
 		if err != nil {
-			return err
+			return false, err
 		}
 	}
 
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+
+	return true, nil
 }

@@ -3,9 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -22,17 +25,17 @@ var db *pgxpool.Pool
 
 type Entry struct {
 	AccountID string `json:"account_id"`
-	Direction string `json:"direction"`
+	Direction string `json:"direction"` // debit | credit
 	Amount    int64  `json:"amount"`
 }
 
 type TransactionPostedEvent struct {
-	EventID       string  `json:"event_id"`
-	TransactionID string  `json:"transaction_id"`
-	Entries       []Entry `json:"entries"`
-	Status        string  `json:"status"`
-	OccurredAt    string  `json:"occurred_at"`
-	Version       int     `json:"version"`
+	EventID       string    `json:"event_id"`
+	TransactionID string    `json:"transaction_id"`
+	Entries       []Entry   `json:"entries"`
+	Status        string    `json:"status"`
+	OccurredAt    time.Time `json:"occurred_at"`
+	Version       int       `json:"version"`
 }
 
 type CreateTransactionRequest struct {
@@ -45,27 +48,44 @@ type CreateTransactionRequest struct {
 // ==========================
 
 func main() {
-
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
 		log.Fatal("DATABASE_URL not set")
 	}
 
 	var err error
-	db, err = pgxpool.New(context.Background(), dsn)
+	config, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		log.Fatalf("Unable to parse DATABASE_URL: %v", err)
+	}
+
+	// pool tuning (good defaults; adjust later based on load)
+	config.MaxConns = 10
+	config.MinConns = 2
+	config.MaxConnLifetime = time.Hour
+	config.MaxConnIdleTime = 30 * time.Minute
+
+	db, err = pgxpool.NewWithConfig(context.Background(), config)
 	if err != nil {
 		log.Fatalf("Unable to connect to database: %v", err)
 	}
-	defer db.Close()
-
 	log.Println("Connected to database successfully")
 
+	// Kafka + outbox
 	initKafkaProducer()
 	startOutboxWorker()
-	defer closeKafkaProducer()
 
+	// Router
 	r := gin.New()
 	r.Use(gin.Logger(), gin.Recovery())
+
+	// Hard request timeout (prevents hung requests)
+	r.Use(func(c *gin.Context) {
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+		defer cancel()
+		c.Request = c.Request.WithContext(ctx)
+		c.Next()
+	})
 
 	// ==========================
 	// HEALTH
@@ -75,10 +95,14 @@ func main() {
 	})
 
 	// ==========================
+	// METRICS
+	// ==========================
+	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
+
+	// ==========================
 	// CREATE TRANSACTION
 	// ==========================
 	r.POST("/transactions", func(c *gin.Context) {
-
 		var req CreateTransactionRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -94,13 +118,19 @@ func main() {
 		var creditTotal int64
 
 		for _, e := range req.Entries {
+			// entry validation (must be strict in a ledger)
+			if e.AccountID == "" || e.Amount <= 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid entry (account_id required, amount must be > 0)"})
+				return
+			}
+
 			switch e.Direction {
 			case "debit":
 				debitTotal += e.Amount
 			case "credit":
 				creditTotal += e.Amount
 			default:
-				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid direction"})
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid direction (must be debit or credit)"})
 				return
 			}
 		}
@@ -111,18 +141,26 @@ func main() {
 		}
 
 		ctx := c.Request.Context()
+
 		tx, err := db.Begin(ctx)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start db tx"})
 			return
 		}
-		defer tx.Rollback(ctx)
+
+		committed := false
+		defer func() {
+			if !committed {
+				_ = tx.Rollback(ctx)
+			}
+		}()
 
 		var txID string
 		var isNew bool
 
+		// Idempotency via unique idempotency_key + "xmax=0" trick for inserted row
 		err = tx.QueryRow(ctx, `
-			INSERT INTO transactions (idempotency_key, status)
+			INSERT INTO public.transactions (idempotency_key, status)
 			VALUES ($1, $2)
 			ON CONFLICT (idempotency_key)
 			DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key
@@ -145,7 +183,7 @@ func main() {
 		// Insert entries
 		for _, e := range req.Entries {
 			_, err := tx.Exec(ctx, `
-				INSERT INTO entries (transaction_id, account_id, direction, amount)
+				INSERT INTO public.entries (transaction_id, account_id, direction, amount)
 				VALUES ($1, $2, $3, $4)
 			`, txID, e.AccountID, e.Direction, e.Amount)
 
@@ -155,15 +193,13 @@ func main() {
 			}
 		}
 
-		// ✅ Proper event identity separation
-		eventID := uuid.New().String()
-
+		// Event identity separation
 		event := TransactionPostedEvent{
-			EventID:       eventID,
+			EventID:       uuid.New().String(),
 			TransactionID: txID,
 			Entries:       req.Entries,
 			Status:        "posted",
-			OccurredAt:    time.Now().UTC().Format(time.RFC3339Nano),
+			OccurredAt:    time.Now().UTC(),
 			Version:       1,
 		}
 
@@ -173,9 +209,9 @@ func main() {
 			return
 		}
 
-		// Insert into outbox
+		// Transactional outbox insert
 		_, err = tx.Exec(ctx, `
-			INSERT INTO outbox (aggregate_type, aggregate_id, event_type, payload)
+			INSERT INTO public.outbox (aggregate_type, aggregate_id, event_type, payload)
 			VALUES ($1, $2, $3, $4)
 		`, "transaction", txID, "ledger.transaction.posted", payloadBytes)
 
@@ -188,6 +224,7 @@ func main() {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "commit failed"})
 			return
 		}
+		committed = true
 
 		c.JSON(http.StatusCreated, gin.H{
 			"transaction_id": txID,
@@ -197,28 +234,20 @@ func main() {
 	})
 
 	// ==========================
-	// METRICS
-	// ==========================
-	r.GET("/metrics", func(c *gin.Context) {
-		promhttp.Handler().ServeHTTP(c.Writer, c.Request)
-	})
-
-	// ==========================
 	// BALANCE (READ MODEL — TRUE CQRS)
 	// ==========================
 	r.GET("/accounts/:id/balance", func(c *gin.Context) {
 		accountID := c.Param("id")
 
 		var balance int64
-
-		err := db.QueryRow(context.Background(), `
+		err := db.QueryRow(c.Request.Context(), `
 			SELECT balance
 			FROM read_model.account_balances
 			WHERE account_id = $1
 		`, accountID).Scan(&balance)
 
 		if err != nil {
-			// If account not yet projected, return 0
+			// If not projected yet OR missing, return 0
 			c.JSON(http.StatusOK, gin.H{
 				"account_id": accountID,
 				"balance":    0,
@@ -232,11 +261,42 @@ func main() {
 		})
 	})
 
+	// ==========================
+	// SERVER + GRACEFUL SHUTDOWN
+	// ==========================
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8081"
 	}
 
-	log.Printf("Server running on port %s", port)
-	log.Fatal(r.Run(":" + port))
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           r,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	// shutdown on SIGINT/SIGTERM
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		log.Printf("Server running on port %s", port)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("listen error: %v", err)
+		}
+	}()
+
+	<-stop
+	log.Println("Shutting down...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	_ = srv.Shutdown(ctx)
+
+	// Clean up infra
+	closeKafkaProducer()
+	db.Close()
+
+	log.Println("Shutdown complete")
 }
