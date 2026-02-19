@@ -33,4 +33,20 @@ var (
 			Help: "Total events moved to DLQ",
 		},
 	)
+
+	// 🔥 NEW — Circuit Breaker Metrics
+
+	kafkaCircuitBreakerState = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "kafka_circuit_breaker_state",
+			Help: "Kafka circuit breaker state (0=closed,1=open,2=half_open)",
+		},
+	)
+
+	kafkaCircuitBreakerOpenTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "kafka_circuit_breaker_open_total",
+			Help: "Total number of times Kafka circuit breaker opened",
+		},
+	)
 )

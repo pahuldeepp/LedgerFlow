@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
-	"log"
+	"errors"
 	"time"
+
+	"go.uber.org/zap"
 )
 
 const (
@@ -12,6 +14,9 @@ const (
 	batchSize      = 10
 	pollInterval   = 1 * time.Second
 )
+
+// Circuit breaker: open after 5 publish failures, try again after 10s
+var kafkaBreaker = NewCircuitBreaker(5, 10*time.Second)
 
 type outboxItem struct {
 	id        string
@@ -26,7 +31,7 @@ func startOutboxWorker() {
 
 		for range ticker.C {
 			if err := processOutboxBatch(); err != nil {
-				log.Println("outbox worker error:", err)
+				L().Error("outbox_worker_error", zap.Error(err))
 			}
 		}
 	}()
@@ -58,7 +63,7 @@ func processOutboxBatch() error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	rows, err := tx.Query(ctx, `
 		SELECT id::text, event_type, payload::text
@@ -99,9 +104,23 @@ func processOutboxBatch() error {
 	// -----------------------------
 	for _, it := range batch {
 
-		err := publishToKafka(it.id, []byte(it.payload))
-		if err != nil {
+		// ✅ Circuit breaker protects Kafka publish
+		err := kafkaBreaker.Execute(func() error {
+			return publishToKafka(it.id, []byte(it.payload))
+		})
 
+		// If breaker is OPEN, we do NOT increment attempts or DLQ.
+		// We just back off briefly and let next tick retry.
+		if errors.Is(err, ErrCircuitOpen) {
+			L().Warn("kafka_breaker_open_skip_publish",
+				zap.String("outbox_id", it.id),
+				zap.String("breaker_state", string(kafkaBreaker.State())),
+			)
+			time.Sleep(500 * time.Millisecond)
+			return nil // stop batch early (prevents busy looping)
+		}
+
+		if err != nil {
 			if outboxPublishFailedTotal != nil {
 				outboxPublishFailedTotal.Inc()
 			}
@@ -120,13 +139,19 @@ func processOutboxBatch() error {
 			`, it.id, err.Error(), maxBackoffSecs).Scan(&attempts)
 
 			if err2 != nil {
-				log.Println("outbox: failed to record publish failure:", err2)
+				L().Error("outbox_record_publish_failure_failed",
+					zap.String("outbox_id", it.id),
+					zap.Error(err2),
+				)
 				continue
 			}
 
 			if attempts >= maxAttempts {
 				if err := moveToDLQ(ctx, it.id); err != nil {
-					log.Println("outbox: failed to move to DLQ:", err)
+					L().Error("outbox_move_to_dlq_failed",
+						zap.String("outbox_id", it.id),
+						zap.Error(err),
+					)
 				} else if outboxDLQTotal != nil {
 					outboxDLQTotal.Inc()
 				}
@@ -147,12 +172,14 @@ func processOutboxBatch() error {
 		`, it.id)
 
 		if err != nil {
-			log.Println("outbox: failed to mark published:", err)
+			L().Error("outbox_mark_published_failed",
+				zap.String("outbox_id", it.id),
+				zap.Error(err),
+			)
 			continue
 		}
 
-		rowsAffected := res.RowsAffected()
-		if rowsAffected == 0 {
+		if res.RowsAffected() == 0 {
 			// Another worker already handled it
 			continue
 		}
@@ -170,7 +197,7 @@ func moveToDLQ(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	_, err = tx.Exec(ctx, `
 		INSERT INTO outbox_dlq (
