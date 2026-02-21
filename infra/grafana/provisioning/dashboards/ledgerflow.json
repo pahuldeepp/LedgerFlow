@@ -1,0 +1,28 @@
+{
+  "title": "LedgerFlow Observability",
+  "timezone": "browser",
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Circuit Breaker State",
+      "targets": [
+        {
+          "expr": "kafka_circuit_breaker_state"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Outbox Publish Failures",
+      "targets": [
+        {
+          "expr": "outbox_publish_failed_total"
+        }
+      ],
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 }
+    }
+  ],
+  "schemaVersion": 36,
+  "version": 1
+}

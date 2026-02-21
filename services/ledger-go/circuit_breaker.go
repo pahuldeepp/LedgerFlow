@@ -39,7 +39,7 @@ func NewCircuitBreaker(failureThreshold int, openTimeout time.Duration) *Circuit
 	}
 
 	// initialize metric state
-	kafkaCircuitBreakerState.Set(0)
+	KafkaCircuitBreakerState.Set(0)
 
 	return cb
 }
@@ -72,7 +72,7 @@ func (cb *CircuitBreaker) beforeCall() error {
 			cb.halfOpenInFlight = false
 			cb.lastStateTime = time.Now()
 
-			kafkaCircuitBreakerState.Set(2)
+			KafkaCircuitBreakerState.Set(2)
 		} else {
 			return ErrCircuitOpen
 		}
@@ -114,7 +114,7 @@ func (cb *CircuitBreaker) afterCall(callErr error) {
 			cb.failures = 0
 			cb.lastStateTime = time.Now()
 
-			kafkaCircuitBreakerState.Set(0)
+			KafkaCircuitBreakerState.Set(0)
 			return
 		}
 
@@ -122,7 +122,7 @@ func (cb *CircuitBreaker) afterCall(callErr error) {
 		cb.tripOpenLocked()
 
 	case StateOpen:
-		// Should not execute normally
+		// No-op
 	}
 }
 
@@ -130,6 +130,6 @@ func (cb *CircuitBreaker) tripOpenLocked() {
 	cb.state = StateOpen
 	cb.lastStateTime = time.Now()
 
-	kafkaCircuitBreakerOpenTotal.Inc()
-	kafkaCircuitBreakerState.Set(1)
+	KafkaCircuitBreakerOpenTotal.Inc()
+	KafkaCircuitBreakerState.Set(1)
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"strings"
@@ -16,7 +17,7 @@ var kafkaTopic string
 func initKafkaProducer() {
 	brokersEnv := os.Getenv("KAFKA_BROKERS")
 	if brokersEnv == "" {
-		brokersEnv = "localhost:9092" // local fallback
+		brokersEnv = "localhost:9092"
 	}
 
 	kafkaTopic = os.Getenv("KAFKA_TOPIC")
@@ -50,9 +51,10 @@ func closeKafkaProducer() {
 	}
 }
 
-func publishToKafka(eventKey string, payload []byte) error {
+// FIXED: event_type header must be the real event type, not the outbox id.
+func publishToKafka(eventKey string, eventType string, payload []byte) error {
 	if kafkaWriter == nil {
-		return nil
+		return fmt.Errorf("kafka writer not initialized")
 	}
 
 	msg := kafka.Message{
@@ -60,7 +62,8 @@ func publishToKafka(eventKey string, payload []byte) error {
 		Value: payload,
 		Time:  time.Now(),
 		Headers: []kafka.Header{
-			{Key: "event_type", Value: []byte(eventKey)},
+			{Key: "event_id", Value: []byte(eventKey)},
+			{Key: "event_type", Value: []byte(eventType)},
 			{Key: "version", Value: []byte("v1")},
 		},
 	}

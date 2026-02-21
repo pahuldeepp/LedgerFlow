@@ -3,53 +3,101 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"sync"
+	
 	"log"
+	"math"
+	"math/rand"
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
+	
 	"syscall"
 	"time"
-
+		"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/segmentio/kafka-go"
 )
-
-const workerCount = 10
-const jobBufferSize = 100
-
-type result struct {
-	msg      kafka.Message
-	commitOK bool // true only if processing succeeded OR we chose to skip (bad payload)
+type dbtx interface {
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
-func main() {
-	startMetricsServer()
+const (
+	workerCount   = 10
+	jobBufferSize = 100
+	// FIX: maxAttempts was duplicated — define it only here for the read-model-builder.
+	maxAttempts = 5
+)
 
-	// Cancelable context so FetchMessage + CommitMessages can be stopped on shutdown
+type result struct {
+	msg    kafka.Message
+	ok     bool
+	errMsg string
+}
+
+//
+// ============================================================
+// THREAD-SAFE COMMITTED OFFSETS (for lag monitor)
+// ============================================================
+//
+
+type offsetTracker struct {
+	mu      sync.RWMutex
+	offsets map[int]int64
+}
+
+func newOffsetTracker() *offsetTracker {
+	return &offsetTracker{offsets: make(map[int]int64)}
+}
+
+func (t *offsetTracker) Set(partition int, offset int64) {
+	t.mu.Lock()
+	t.offsets[partition] = offset
+	t.mu.Unlock()
+}
+
+func (t *offsetTracker) Get(partition int) (int64, bool) {
+	t.mu.RLock()
+	v, ok := t.offsets[partition]
+	t.mu.RUnlock()
+	return v, ok
+}
+
+func (t *offsetTracker) Snapshot() map[int]int64 {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	cp := make(map[int]int64, len(t.offsets))
+	for k, v := range t.offsets {
+		cp[k] = v
+	}
+	return cp
+}
+
+//
+// ============================================================
+// MAIN
+// ============================================================
+//
+
+func main() {
+	rand.Seed(time.Now().UnixNano())
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// OS signals for graceful shutdown (Ctrl+C / docker stop / k8s SIGTERM)
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		log.Fatal("DATABASE_URL not set")
-	}
+	dsn := mustEnv("DATABASE_URL")
+	kafkaBrokers := mustEnv("KAFKA_BROKERS")
+	topic := mustEnv("KAFKA_TOPIC")
 
-	kafkaBrokers := os.Getenv("KAFKA_BROKERS")
-	if kafkaBrokers == "" {
-		log.Fatal("KAFKA_BROKERS not set")
-	}
-
-	topic := os.Getenv("KAFKA_TOPIC")
-	if topic == "" {
-		log.Fatal("KAFKA_TOPIC not set")
-	}
-
-	// Connect to Postgres
+	// -------------------------
+	// CONNECT DB
+	// -------------------------
 	db, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		log.Fatal("db connection error:", err)
@@ -57,41 +105,85 @@ func main() {
 	defer db.Close()
 	log.Println("Connected to Postgres")
 
-	// Kafka reader
+	// -------------------------
+	// REBUILD MODE
+	// -------------------------
+	rebuild := strings.EqualFold(os.Getenv("REBUILD"), "true")
+
+	consumerGroup := "read-model-builder"
+	startOffset := kafka.LastOffset
+	if rebuild {
+		consumerGroup = "read-model-builder-rebuild-" + time.Now().Format("20060102-150405")
+		startOffset = kafka.FirstOffset
+		log.Println("REBUILD MODE ENABLED")
+
+		if err := rebuildReadModel(ctx, db); err != nil {
+			log.Fatal("rebuild failed:", err)
+		}
+	}
+
+	brokers := strings.Split(kafkaBrokers, ",")
+
+	startMetricsServer(db, brokers)
+
+	// -------------------------
+	// KAFKA READER
+	// -------------------------
 	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers: strings.Split(kafkaBrokers, ","),
-		Topic:   topic,
-		GroupID: "read-model-builder",
+		Brokers:     brokers,
+		Topic:       topic,
+		GroupID:     consumerGroup,
+		StartOffset: startOffset,
 	})
 	defer reader.Close()
-	log.Println("Kafka consumer started, waiting for messages...")
+	log.Println("Kafka consumer started (group:", consumerGroup, ")")
 
-	// Buffered job channel (backpressure control)
+	// -------------------------
+	// DLQ WRITER
+	// -------------------------
+	dlqWriter := &kafka.Writer{
+		Addr:         kafka.TCP(brokers...),
+		Topic:        topic + ".dlq",
+		Balancer:     &kafka.LeastBytes{},
+		RequiredAcks: kafka.RequireAll,
+	}
+	defer dlqWriter.Close()
+
+	// -------------------------
+	// PIPELINE CHANNELS
+	// -------------------------
 	jobs := make(chan kafka.Message, jobBufferSize)
-
-	// Results channel (workers publish processing outcome here)
 	results := make(chan result, jobBufferSize)
 
-	// Start worker pool (drainable via WaitGroup + close(jobs))
+	// -------------------------
+	// WORKER POOL
+	// -------------------------
 	var wg sync.WaitGroup
 	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
 		go worker(ctx, db, jobs, results, i, &wg)
 	}
 
-	// Single committer: commit offsets IN ORDER per partition
-	committerDone := make(chan struct{})
-	go committer(ctx, reader, results, committerDone)
+	// -------------------------
+	// COMMITTER
+	// -------------------------
+	offsets := newOffsetTracker()
 
-	// Fetch loop runs in its own goroutine so main can orchestrate shutdown
+
+	StartLagReporter(kafkaBrokers, topic, consumerGroup, offsets, 5*time.Second)
+
+	committerDone := make(chan struct{})
+	go committer(ctx, db, reader, dlqWriter, results, committerDone, offsets)
+
+	// -------------------------
+	// FETCH LOOP
+	// -------------------------
 	fetchDone := make(chan struct{})
 	go func() {
 		defer close(fetchDone)
-
 		for {
 			msg, err := reader.FetchMessage(ctx)
 			if err != nil {
-				// If we're shutting down, FetchMessage will return error because ctx is canceled
 				if ctx.Err() != nil {
 					return
 				}
@@ -99,8 +191,6 @@ func main() {
 				time.Sleep(2 * time.Second)
 				continue
 			}
-
-			// Backpressure: blocks when buffer full
 			select {
 			case jobs <- msg:
 			case <-ctx.Done():
@@ -109,11 +199,12 @@ func main() {
 		}
 	}()
 
-	// Wait for shutdown signal
+	// -------------------------
+	// SHUTDOWN
+	// -------------------------
 	<-sigChan
 	log.Println("Shutdown signal received")
-
-	// Stop fetch loop, then drain workers, then stop committer
+		
 	cancel()
 	<-fetchDone
 
@@ -125,6 +216,12 @@ func main() {
 
 	log.Println("Graceful shutdown complete")
 }
+
+//
+// ============================================================
+// WORKER
+// ============================================================
+//
 
 func worker(
 	ctx context.Context,
@@ -138,79 +235,82 @@ func worker(
 	log.Println("Worker started:", id)
 
 	for msg := range jobs {
-		ok := processMessage(ctx, db, msg)
-		// If ctx canceled during shutdown, best-effort exit
+		ok, errMsg := processMessage(ctx, db, msg)
+
 		select {
-		case results <- result{msg: msg, commitOK: ok}:
+		case results <- result{msg: msg, ok: ok, errMsg: errMsg}:
 		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-func processMessage(
-	ctx context.Context,
-	db *pgxpool.Pool,
-	msg kafka.Message,
-) bool {
+func processMessage(ctx context.Context, db *pgxpool.Pool, msg kafka.Message) (bool, string) {
 	start := time.Now()
 
 	var event TransactionPostedEvent
 	if err := json.Unmarshal(msg.Value, &event); err != nil {
-		log.Println("invalid payload:", err)
-
 		eventsFailed.Inc()
 		eventProcessingDuration.Observe(time.Since(start).Seconds())
-
-		return true // commit to skip poison message
+		log.Printf("poison message at partition=%d offset=%d: %v", msg.Partition, msg.Offset, err)
+		return true, "" // poison pill -> commit to skip
 	}
+
+	log.Printf("processing event_id=%s transaction_id=%s", event.EventID, event.TransactionID)
 
 	processed, err := handleTransactionPosted(ctx, db, event)
 	if err != nil {
-		log.Println("handler error:", err)
-
 		eventsFailed.Inc()
 		eventProcessingDuration.Observe(time.Since(start).Seconds())
-
-		return false // do NOT commit => retry
+		log.Printf("handler error event_id=%s: %v", event.EventID, err)
+		return false, err.Error()
 	}
 
 	if processed {
 		eventsProcessed.Inc()
-		log.Println("Processed event:", event.EventID)
+		log.Printf("processed event_id=%s", event.EventID)
 	} else {
 		eventsDuplicates.Inc()
-		log.Println("Duplicate skipped:", event.EventID)
+		log.Printf("duplicate skipped event_id=%s", event.EventID)
 	}
 
 	eventProcessingDuration.Observe(time.Since(start).Seconds())
-	return true
+	return true, ""
 }
 
-func committer(ctx context.Context, reader *kafka.Reader, results <-chan result, done chan<- struct{}) {
+//
+// ============================================================
+// COMMITTER
+// ============================================================
+//
+
+func committer(
+	ctx context.Context,
+	db *pgxpool.Pool,
+	reader *kafka.Reader,
+	dlqWriter *kafka.Writer,
+	results <-chan result,
+	done chan<- struct{},
+	offsets *offsetTracker,
+) {
 	defer close(done)
 
-	// next expected offset per partition
 	nextOffset := make(map[int]int64)
-	// pending results per partition keyed by offset
 	pending := make(map[int]map[int64]result)
 
 	for r := range results {
 		p := r.msg.Partition
+		off := r.msg.Offset
 
 		if pending[p] == nil {
 			pending[p] = make(map[int64]result)
 		}
-		pending[p][r.msg.Offset] = r
+		pending[p][off] = r
 
-		// Initialize nextOffset to the first seen offset (for this runtime).
-		// Note: after a restart, the group offset determines where FetchMessage starts,
-		// so "first seen" is safe as the start-of-stream for this process.
 		if _, ok := nextOffset[p]; !ok {
-			nextOffset[p] = r.msg.Offset
+			nextOffset[p] = off
 		}
 
-		// Commit sequentially as far as possible
 		for {
 			want := nextOffset[p]
 			item, ok := pending[p][want]
@@ -218,23 +318,254 @@ func committer(ctx context.Context, reader *kafka.Reader, results <-chan result,
 				break
 			}
 
-			if !item.commitOK {
-				// processing failed -> stop committing further offsets for this partition
+			if !item.ok {
+				var ev TransactionPostedEvent
+				if err := json.Unmarshal(item.msg.Value, &ev); err != nil || ev.EventID == "" {
+					_ = dlqWriter.WriteMessages(ctx, kafka.Message{
+						Key:   item.msg.Key,
+						Value: item.msg.Value,
+						Headers: append(item.msg.Headers,
+							kafka.Header{Key: "dlq-error", Value: []byte("unparseable payload")},
+						),
+					})
+					if err := reader.CommitMessages(ctx, item.msg); err != nil {
+						log.Println("commit after poison DLQ failed:", err)
+						break
+					}
+
+					offsets.Set(p, want)
+					delete(pending[p], want)
+					nextOffset[p]++
+					continue
+				}
+
+				retryCount, nextRetryAt, exists, err := getFailure(ctx, db, ev.EventID)
+				if err != nil {
+					log.Println("getFailure error:", err)
+					break
+				}
+
+				if exists && time.Now().Before(nextRetryAt) {
+					log.Printf("Backoff active: event_id=%s retry=%d next=%s",
+						ev.EventID, retryCount, nextRetryAt.Format(time.RFC3339))
+					break
+				}
+
+				newRetry := 1
+				if exists {
+					newRetry = retryCount + 1
+				}
+
+				if newRetry >= maxAttempts {
+					log.Printf("DLQ: event_id=%s attempts=%d err=%s", ev.EventID, newRetry, item.errMsg)
+
+					_ = dlqWriter.WriteMessages(ctx, kafka.Message{
+						Key:   item.msg.Key,
+						Value: item.msg.Value,
+						Headers: append(item.msg.Headers,
+							kafka.Header{Key: "dlq-error", Value: []byte(item.errMsg)},
+							kafka.Header{Key: "dlq-attempts", Value: []byte(intToBytes(newRetry))},
+							kafka.Header{Key: "source-topic", Value: []byte(item.msg.Topic)},
+							kafka.Header{Key: "source-partition", Value: []byte(intToBytes(item.msg.Partition))},
+							kafka.Header{Key: "source-offset", Value: []byte(int64ToBytes(item.msg.Offset))},
+						),
+					})
+
+					if err := reader.CommitMessages(ctx, item.msg); err != nil {
+						log.Println("commit after DLQ failed:", err)
+						break
+					}
+
+					// FIX: don't swallow errors
+					if err := clearFailure(ctx, db, ev.EventID); err != nil {
+						log.Println("clearFailure error:", err)
+					}
+
+					offsets.Set(p, want)
+					delete(pending[p], want)
+					nextOffset[p]++
+					continue
+				}
+
+				backoff := computeBackoff(newRetry)
+				next := time.Now().Add(backoff)
+
+				// FIX: don't swallow errors
+				if err := updateFailure(ctx, db, ev.EventID, newRetry, next, item.errMsg); err != nil {
+					log.Println("updateFailure error:", err)
+				}
+
+				log.Printf("Retry scheduled: event_id=%s retry=%d next=%s",
+					ev.EventID, newRetry, next.Format(time.RFC3339))
+
 				break
 			}
 
 			if err := reader.CommitMessages(ctx, item.msg); err != nil {
-				// If shutting down, exit; otherwise keep pending so we can retry commits
-				if ctx.Err() != nil {
-					return
-				}
 				log.Println("commit error:", err)
-				// Don't advance nextOffset; leave item pending to retry later
 				break
 			}
 
+			var ev TransactionPostedEvent
+			if err := json.Unmarshal(item.msg.Value, &ev); err == nil && ev.EventID != "" {
+				// FIX: don't swallow errors
+				if err := clearFailure(ctx, db, ev.EventID); err != nil {
+					log.Println("clearFailure error:", err)
+				}
+			}
+
+			offsets.Set(p, want)
 			delete(pending[p], want)
-			nextOffset[p] = want + 1
+			nextOffset[p]++
 		}
 	}
+}
+
+//
+// ============================================================
+// FAILURE STORAGE (durable retries)
+// Ensure this table exists in read_model schema:
+//   CREATE TABLE read_model.consumer_failures (...)
+// ============================================================
+//
+
+func getFailure(ctx context.Context, db *pgxpool.Pool, eventID string) (retryCount int, nextRetry time.Time, ok bool, err error) {
+	row := db.QueryRow(ctx, `
+		SELECT retry_count, next_retry_at
+		FROM read_model.consumer_failures
+		WHERE event_id = $1
+	`, eventID)
+
+	if scanErr := row.Scan(&retryCount, &nextRetry); scanErr != nil {
+		if errors.Is(scanErr, pgx.ErrNoRows) {
+			return 0, time.Time{}, false, nil
+		}
+		return 0, time.Time{}, false, scanErr
+	}
+	return retryCount, nextRetry, true, nil
+}
+
+func updateFailure(ctx context.Context, db *pgxpool.Pool, eventID string, retryCount int, nextRetry time.Time, lastError string) error {
+	_, err := db.Exec(ctx, `
+		INSERT INTO read_model.consumer_failures
+			(event_id, retry_count, next_retry_at, last_error, updated_at)
+		VALUES
+			($1, $2, $3, $4, now())
+		ON CONFLICT (event_id)
+		DO UPDATE SET
+			retry_count   = EXCLUDED.retry_count,
+			next_retry_at = EXCLUDED.next_retry_at,
+			last_error    = EXCLUDED.last_error,
+			updated_at    = now()
+	`, eventID, retryCount, nextRetry, lastError)
+	return err
+}
+
+func clearFailure(ctx context.Context, db *pgxpool.Pool, eventID string) error {
+	_, err := db.Exec(ctx, `DELETE FROM read_model.consumer_failures WHERE event_id = $1`, eventID)
+	return err
+}
+
+//
+// ============================================================
+// BACKOFF
+// ============================================================
+//
+
+func computeBackoff(retryCount int) time.Duration {
+	base := 1 * time.Second
+	max := 30 * time.Second
+
+	exp := math.Pow(2, float64(retryCount-1))
+	delay := time.Duration(float64(base) * exp)
+	if delay > max {
+		delay = max
+	}
+
+	jitter := time.Duration(rand.Intn(250)) * time.Millisecond
+	return delay + jitter
+}
+
+//
+// ============================================================
+// REBUILD READ MODEL (FINAL FIX)
+// - truncates everything including failures + processed_events
+// - restart identity for clean rebuild
+// ============================================================
+//
+
+func rebuildReadModel(ctx context.Context, db *pgxpool.Pool) error {
+	_, err := db.Exec(ctx, `
+		TRUNCATE TABLE
+			read_model.account_balances,
+			read_model.tx_feed,
+			read_model.account_tx_index,
+			read_model.processed_events,
+			read_model.consumer_failures
+		RESTART IDENTITY;
+	`)
+	return err
+}
+
+//
+// ============================================================
+// ATOMIC PROJECTION + IDEMPOTENCY (FINAL FIX)
+// ============================================================
+//
+
+
+//
+// ============================================================
+// UTIL
+// ============================================================
+//
+
+func mustEnv(key string) string {
+	v := os.Getenv(key)
+	if v == "" {
+		log.Fatalf("%s not set", key)
+	}
+	return v
+}
+
+func intToBytes(n int) []byte {
+	if n == 0 {
+		return []byte("0")
+	}
+	buf := make([]byte, 0, 12)
+	x := n
+	if x < 0 {
+		buf = append(buf, '-')
+		x = -x
+	}
+	tmp := make([]byte, 0, 10)
+	for x > 0 {
+		tmp = append(tmp, byte('0'+(x%10)))
+		x /= 10
+	}
+	for i := len(tmp) - 1; i >= 0; i-- {
+		buf = append(buf, tmp[i])
+	}
+	return buf
+}
+
+func int64ToBytes(n int64) []byte {
+	if n == 0 {
+		return []byte("0")
+	}
+	buf := make([]byte, 0, 24)
+	x := n
+	if x < 0 {
+		buf = append(buf, '-')
+		x = -x
+	}
+	tmp := make([]byte, 0, 20)
+	for x > 0 {
+		tmp = append(tmp, byte('0'+(x%10)))
+		x /= 10
+	}
+	for i := len(tmp) - 1; i >= 0; i-- {
+		buf = append(buf, tmp[i])
+	}
+	return buf
 }

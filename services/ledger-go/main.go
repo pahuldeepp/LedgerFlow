@@ -9,15 +9,18 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
-
+	"fmt"
+	"net"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgconn"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
-)
 
+)
+var kafkaBroker = os.Getenv("KAFKA_BROKERS")
 var db *pgxpool.Pool
 
 // ==========================
@@ -71,16 +74,10 @@ func main() {
 	if err != nil {
 		L().Fatal("Unable to connect to database", zap.Error(err))
 	}
-
 	L().Info("connected_to_database")
 
-	// Kafka + outbox
 	initKafkaProducer()
 	startOutboxWorker()
-
-	// ==========================
-	// ROUTER
-	// ==========================
 
 	r := gin.New()
 	r.Use(RequestID(), ZapLogger(), ZapRecovery())
@@ -93,18 +90,28 @@ func main() {
 		c.Next()
 	})
 
-	// ==========================
-	// HEALTH
-	// ==========================
-
+	// Health
 	r.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
-	})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
 
-	// ==========================
-	// METRICS
-	// ==========================
+	// Check DB
+	if err := db.Ping(ctx); err != nil {
+		c.JSON(503, gin.H{"status": "db_unhealthy", "error": err.Error()})
+		return
+	}
 
+	// Check Kafka (simple TCP dial)
+	conn, err := net.DialTimeout("tcp", kafkaBroker, 1*time.Second)
+	if err != nil {
+		c.JSON(503, gin.H{"status": "kafka_unreachable", "error": err.Error()})
+		return
+	}
+	conn.Close()
+
+	c.JSON(200, gin.H{"status": "ok"})
+})
+	// Metrics
 	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	// ==========================
@@ -113,6 +120,7 @@ func main() {
 
 	r.POST("/transactions", func(c *gin.Context) {
 		var req CreateTransactionRequest
+
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
@@ -149,101 +157,144 @@ func main() {
 		}
 
 		ctx := c.Request.Context()
+		const maxRetries = 3
 
-		// 🔒 SERIALIZABLE isolation
-		tx, err := db.BeginTx(ctx, pgx.TxOptions{
-			IsoLevel: pgx.Serializable,
-		})
-		if err != nil {
-			L().Error("db_tx_begin_failed", zap.Error(err))
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start tx"})
-			return
-		}
+		for attempt := 1; attempt <= maxRetries; attempt++ {
 
-		committed := false
-		defer func() {
-			if !committed {
-				_ = tx.Rollback(ctx)
+			tx, err := db.BeginTx(ctx, pgx.TxOptions{
+				IsoLevel: pgx.Serializable,
+			})
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start tx"})
+				return
 			}
-		}()
 
-		var txID string
-		var isNew bool
+			var txID string
 
-		err = tx.QueryRow(ctx, `
-			INSERT INTO public.transactions (idempotency_key, status)
-			VALUES ($1, $2)
-			ON CONFLICT (idempotency_key)
-			DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key
-			RETURNING id, (xmax = 0) AS is_new
-		`, req.IdempotencyKey, "posted").Scan(&txID, &isNew)
+			err = tx.QueryRow(ctx, `
+				INSERT INTO public.transactions (idempotency_key, status)
+				VALUES ($1, $2)
+				ON CONFLICT (idempotency_key) DO NOTHING
+				RETURNING id
+			`, req.IdempotencyKey, "posted").Scan(&txID)
 
-		if err != nil {
-			L().Error("tx_insert_failed", zap.Error(err))
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "insert failed"})
-			return
-		}
+			if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+				tx.Rollback(ctx)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "insert failed"})
+				return
+			}
 
-		if !isNew {
-			c.JSON(http.StatusOK, gin.H{
-				"status":         "already_processed",
+			// Already processed
+			if errors.Is(err, pgx.ErrNoRows) {
+				var existingID string
+				if lookupErr := tx.QueryRow(ctx,
+					`SELECT id FROM public.transactions WHERE idempotency_key = $1`,
+					req.IdempotencyKey,
+				).Scan(&existingID); lookupErr != nil {
+					tx.Rollback(ctx)
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "lookup failed"})
+					return
+				}
+
+				tx.Rollback(ctx)
+				c.JSON(http.StatusOK, gin.H{
+					"status":         "already_processed",
+					"transaction_id": existingID,
+				})
+				return
+			}
+
+			// Insert entries
+			for _, e := range req.Entries {
+				_, err := tx.Exec(ctx, `
+					INSERT INTO public.entries (transaction_id, account_id, direction, amount)
+					VALUES ($1, $2, $3, $4)
+				`, txID, e.AccountID, e.Direction, e.Amount)
+
+				if err != nil {
+    tx.Rollback(ctx)
+    L().Error("entry_insert_failed", zap.Error(err))
+    c.JSON(http.StatusInternalServerError, gin.H{
+        "error": err.Error(),
+    })
+    return
+}
+			}
+			// 🔒 Authoritative DB invariant check (debit == credit)
+var dbDebitTotal int64
+var dbCreditTotal int64
+
+err = tx.QueryRow(ctx, `
+    SELECT
+        COALESCE(SUM(CASE WHEN direction = 'debit' THEN amount ELSE 0 END), 0),
+        COALESCE(SUM(CASE WHEN direction = 'credit' THEN amount ELSE 0 END), 0)
+    FROM public.entries
+    WHERE transaction_id = $1
+`, txID).Scan(&dbDebitTotal, &dbCreditTotal)
+
+if err != nil {
+    tx.Rollback(ctx)
+    c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify ledger invariant"})
+    return
+}
+
+if dbDebitTotal != dbCreditTotal {
+    tx.Rollback(ctx)
+    c.JSON(http.StatusBadRequest, gin.H{
+        "error": fmt.Sprintf(
+            "ledger invariant violation: debits (%d) != credits (%d)",
+            dbDebitTotal, dbCreditTotal,
+        ),
+    })
+    return
+}
+
+			// Create outbox event
+			event := TransactionPostedEvent{
+				EventID:       uuid.New().String(),
+				TransactionID: txID,
+				Entries:       req.Entries,
+				Status:        "posted",
+				OccurredAt:    time.Now().UTC(),
+				Version:       1,
+			}
+
+			payloadBytes, err := json.Marshal(event)
+			if err != nil {
+				tx.Rollback(ctx)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "event marshal failed"})
+				return
+			}
+
+			_, err = tx.Exec(ctx, `
+				INSERT INTO public.outbox (aggregate_type, aggregate_id, event_type, payload)
+				VALUES ($1, $2, $3, $4)
+			`, "transaction", txID, "ledger.transaction.posted", payloadBytes)
+
+			if err != nil {
+				tx.Rollback(ctx)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "outbox insert failed"})
+				return
+			}
+
+			// Commit
+			if commitErr := tx.Commit(ctx); commitErr != nil {
+				if pgErr, ok := commitErr.(*pgconn.PgError); ok && pgErr.Code == "40001" {
+					continue // retry
+				}
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "commit failed"})
+				return
+			}
+
+			c.JSON(http.StatusCreated, gin.H{
 				"transaction_id": txID,
+				"debit_total":    debitTotal,
+				"credit_total":   creditTotal,
 			})
 			return
 		}
 
-		for _, e := range req.Entries {
-			_, err := tx.Exec(ctx, `
-				INSERT INTO public.entries (transaction_id, account_id, direction, amount)
-				VALUES ($1, $2, $3, $4)
-			`, txID, e.AccountID, e.Direction, e.Amount)
-
-			if err != nil {
-				L().Error("entry_insert_failed", zap.Error(err))
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "entry insert failed"})
-				return
-			}
-		}
-
-		event := TransactionPostedEvent{
-			EventID:       uuid.New().String(),
-			TransactionID: txID,
-			Entries:       req.Entries,
-			Status:        "posted",
-			OccurredAt:    time.Now().UTC(),
-			Version:       1,
-		}
-
-		payloadBytes, err := json.Marshal(event)
-		if err != nil {
-			L().Error("event_marshal_failed", zap.Error(err))
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "event marshal failed"})
-			return
-		}
-
-		_, err = tx.Exec(ctx, `
-			INSERT INTO public.outbox (aggregate_type, aggregate_id, event_type, payload)
-			VALUES ($1, $2, $3, $4)
-		`, "transaction", txID, "ledger.transaction.posted", payloadBytes)
-
-		if err != nil {
-			L().Error("outbox_insert_failed", zap.Error(err))
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "outbox insert failed"})
-			return
-		}
-
-		if err := tx.Commit(ctx); err != nil {
-			L().Error("tx_commit_failed", zap.Error(err))
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "commit failed"})
-			return
-		}
-		committed = true
-
-		c.JSON(http.StatusCreated, gin.H{
-			"transaction_id": txID,
-			"debit_total":    debitTotal,
-			"credit_total":   creditTotal,
-		})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "transaction failed after retries"})
 	})
 
 	// ==========================
@@ -306,7 +357,6 @@ func main() {
 	defer cancel()
 
 	_ = srv.Shutdown(ctx)
-
 	closeKafkaProducer()
 	db.Close()
 

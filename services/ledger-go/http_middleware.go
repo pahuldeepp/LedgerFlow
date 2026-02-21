@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -29,13 +30,23 @@ func ZapLogger() gin.HandlerFunc {
 		c.Next()
 
 		lat := time.Since(start)
+		method := c.Request.Method
+		path := c.FullPath()
+		status := strconv.Itoa(c.Writer.Status())
+
+		if path == "" {
+			path = "unknown"
+		}
+
+		// ✅ Correct metric usage
+		ObserveHTTPRequest(method, path, status, lat)
+
 		rid, _ := c.Get(requestIDKey)
 
 		L().Info("http_request",
 			zap.Any("request_id", rid),
-			zap.String("method", c.Request.Method),
-			zap.String("path", c.FullPath()),
-			zap.String("raw_path", c.Request.URL.Path),
+			zap.String("method", method),
+			zap.String("path", path),
 			zap.Int("status", c.Writer.Status()),
 			zap.Duration("latency", lat),
 			zap.String("client_ip", c.ClientIP()),
@@ -47,10 +58,12 @@ func ZapLogger() gin.HandlerFunc {
 func ZapRecovery() gin.HandlerFunc {
 	return gin.CustomRecovery(func(c *gin.Context, recovered any) {
 		rid, _ := c.Get(requestIDKey)
+
 		L().Error("panic",
 			zap.Any("request_id", rid),
 			zap.Any("recovered", recovered),
 		)
+
 		c.AbortWithStatus(500)
 	})
 }

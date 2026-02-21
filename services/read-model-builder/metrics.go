@@ -1,10 +1,15 @@
 package main
 
 import (
+	"context"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"strings"
+	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -39,35 +44,72 @@ var (
 		},
 	)
 
-	kafkaLagGauge = prometheus.NewGauge(
-		prometheus.GaugeOpts{
-			Name: "kafka_lag_gauge",
-			Help: "Current Kafka consumer lag",
-		},
-	)
+	kafkaPartitionLag = prometheus.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Name: "kafka_partition_lag",
+		Help: "Current Kafka consumer lag per partition",
+	},
+	[]string{"topic", "partition", "group"},
+)
 )
 
 func init() {
-	prometheus.MustRegister(
-		eventsProcessed,
-		eventsDuplicates,
-		eventsFailed,
-		eventProcessingDuration,
-		kafkaLagGauge,
-	)
+prometheus.MustRegister(
+	eventsProcessed,
+	eventsDuplicates,
+	eventsFailed,
+	eventProcessingDuration,
+	kafkaPartitionLag,
+)
+
 }
 
-func startMetricsServer() {
+func startMetricsServer(db *pgxpool.Pool, brokers []string) {
 	addr := os.Getenv("METRICS_ADDR")
 	if addr == "" {
 		addr = ":9101"
 	}
 
 	mux := http.NewServeMux()
+
+	// Prometheus endpoint
 	mux.Handle("/metrics", promhttp.Handler())
+
+	// Real health endpoint
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+
+		// -------------------
+		// DB Check
+		// -------------------
+		if err := db.Ping(ctx); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte("db unhealthy\n"))
+			return
+		}
+
+		// -------------------
+		// Kafka TCP Check
+		// -------------------
+		if len(brokers) == 0 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte("no brokers configured\n"))
+			return
+		}
+
+		b := strings.TrimSpace(brokers[0])
+		conn, err := net.DialTimeout("tcp", b, 2*time.Second)
+		if err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte("kafka unreachable\n"))
+			return
+		}
+		_ = conn.Close()
+
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		w.Write([]byte("ok\n"))
 	})
 
 	go func() {
