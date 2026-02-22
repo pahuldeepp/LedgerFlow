@@ -1,8 +1,8 @@
+# outbox_worker.py
 import asyncio
 import json
 from aiokafka import AIOKafkaProducer
 from psycopg import errors
-
 from .settings import settings
 from .db import get_conn
 
@@ -43,7 +43,7 @@ async def run_outbox_worker():
                         rows = cur.fetchall()
 
                         if not rows:
-                            # no rows
+                            # No rows to process
                             pass
                         else:
                             for r in rows:
@@ -52,6 +52,7 @@ async def run_outbox_worker():
                                 payload = r["payload"]
 
                                 try:
+                                    # Publish to Kafka
                                     await producer.send_and_wait(
                                         settings.kafka_produce_topic,
                                         payload,
@@ -66,6 +67,7 @@ async def run_outbox_worker():
                                     did_work = True
 
                                 except Exception as e:
+                                    # Retry logic or move to DLQ after max retries
                                     cur.execute(
                                         """
                                         UPDATE billing.outbox

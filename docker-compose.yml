@@ -80,7 +80,7 @@ services:
     build:
       context: ./services/ledger-go
     ports:
-      - "8080:8081"
+      - "8081"
     environment:
       DATABASE_URL: postgres://postgres:postgres@pgbouncer:5432/ledgerflow?sslmode=disable
       KAFKA_BROKERS: kafka:29092
