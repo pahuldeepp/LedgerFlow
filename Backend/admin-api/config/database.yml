@@ -1,0 +1,20 @@
+﻿default: &default
+  adapter: postgresql
+  encoding: unicode
+  pool: <%= ENV.fetch("RAILS_MAX_THREADS", 5) %>
+
+development:
+  adapter: postgresql
+  encoding: unicode
+  host: <%= ENV.fetch("DATABASE_HOST") %>
+  database: ledgerflow
+  username: <%= ENV.fetch("DATABASE_USER") %>
+  password: <%= ENV.fetch("DATABASE_PASSWORD") %>
+  pool: 5
+
+test:
+  <<: *default
+  database: admin_api_test
+
+production:
+  url: <%= ENV.fetch("DATABASE_URL") %>

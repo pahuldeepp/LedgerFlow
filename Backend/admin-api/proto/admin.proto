@@ -1,0 +1,69 @@
+syntax = "proto3";
+
+package ledgerflow.admin.v1;
+
+
+option go_package = "ledger-go/gen/adminv1;adminv1";
+
+service AdminService {
+  rpc ListOutbox(ListOutboxRequest) returns (ListOutboxResponse);
+  rpc GetOutbox(GetOutboxRequest) returns (GetOutboxResponse);
+  rpc ListDlq(ListDlqRequest) returns (ListDlqResponse);
+}
+
+
+enum OutboxStatus {
+  OUTBOX_STATUS_UNSPECIFIED = 0;
+  OUTBOX_STATUS_PENDING = 1;
+  OUTBOX_STATUS_FAILED = 2;
+  OUTBOX_STATUS_PUBLISHED = 3;
+}
+
+message ListOutboxRequest {
+  OutboxStatus status = 1;
+  uint32 limit = 2;
+}
+message OutboxItem {
+  string id = 1;
+  string event_type = 2;
+  string created_at = 3;
+
+  int32 attempts = 4;
+  string next_attempt_at = 5;
+
+  string locked_by = 6;
+  string locked_at = 7;
+
+  string published_at = 8;
+  string last_error = 9;
+}
+
+message ListOutboxResponse {
+  repeated OutboxItem items = 1;
+}
+
+message GetOutboxRequest {
+  string id = 1;
+}
+
+message GetOutboxResponse {
+  OutboxItem item = 1;
+}
+
+message ListDlqRequest {
+  uint32 limit = 1;
+}
+
+message DlqItem {
+  string id = 1;
+  string event_type = 2;
+  string aggregate_id = 3;
+  string created_at = 4;
+  string dlq_at = 5;
+  int32 attempts = 6;
+  string last_error = 7;
+}
+
+message ListDlqResponse {
+  repeated DlqItem items = 1;
+}

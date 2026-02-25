@@ -1,0 +1,60 @@
+version: "3.9"
+
+services:
+  web:
+    build: .
+    volumes:
+      - .:/app
+    command: bash -c "rm -f tmp/pids/server.pid && bundle exec rails server -b 0.0.0.0"
+    environment:
+      RAILS_ENV: development
+      DATABASE_HOST: ledgerflow-postgres
+      DATABASE_USER: postgres
+      DATABASE_PASSWORD: postgres
+      DATABASE_NAME: ledgerflow
+      LEDGER_GRPC_HOST: ledger:9090
+    networks:
+      - ledgerflow_net
+      - backend_net
+    restart: always
+    healthcheck:
+      test: ["CMD", "ruby", "-e", "require 'net/http'; exit(Net::HTTP.get_response(URI('http://localhost:3000/up')).code == '200' ? 0 : 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  oauth2-proxy:
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.6.0
+    container_name: oauth2-proxy
+    env_file:
+      - .env
+    ports:
+      - "4180:4180"
+    networks:
+      - ledgerflow_net
+    restart: always
+
+  nginx:
+    image: nginx:1.25
+    container_name: admin-api-nginx
+    depends_on:
+      - web
+      - oauth2-proxy
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "80:80"
+      - "8088:80"
+    networks:
+      - ledgerflow_net
+      - backend_net  # Ensure both networks are included
+    restart: always
+
+networks:
+  ledgerflow_net:
+    external: true
+    name: ledgerflow_default
+
+  backend_net:
+    external: true
+    name: backend_default 
